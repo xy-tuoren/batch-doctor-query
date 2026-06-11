@@ -1,0 +1,4 @@
+#!/bin/bash
+# 始终用项目 .venv 的 pip，避免装到 Homebrew 全局环境
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec "$ROOT/.venv/bin/pip" "$@"
