@@ -70,6 +70,56 @@ def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+def find_playwright_chromium() -> str | None:
+    """查找本机已安装的 Playwright Chromium（全局缓存在 ms-playwright）。"""
+    roots = []
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_root:
+        roots.append(env_root)
+    roots.append(os.path.expanduser("~/Library/Caches/ms-playwright"))
+
+    candidates = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if not name.startswith("chromium-"):
+                continue
+            base = os.path.join(root, name, "chrome-mac-arm64",
+                                 "Google Chrome for Testing.app",
+                                 "Contents", "MacOS",
+                                 "Google Chrome for Testing")
+            if os.path.isfile(base):
+                candidates.append(base)
+
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
+
+
+def launch_chromium(pw, headless: bool, stealth: bool = True):
+    """优先用 Playwright 默认浏览器；缺 headless shell 时复用已有 Chromium。"""
+    launch_args = {"headless": headless}
+    if stealth:
+        launch_args["args"] = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+    try:
+        return pw.chromium.launch(**launch_args)
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+        chromium = find_playwright_chromium()
+        if chromium:
+            log(f"⚠ 改用已安装的 Playwright Chromium: {chromium}")
+            launch_args["executable_path"] = chromium
+            return pw.chromium.launch(**launch_args)
+        log("⚠ Playwright Chromium 未找到，改用本机 Google Chrome")
+        launch_args["channel"] = "chrome"
+        return pw.chromium.launch(**launch_args)
+
+
 def safe_text(el):
     """安全获取元素文本"""
     try:
@@ -1237,13 +1287,7 @@ def test_captcha_only(
     reasons: Counter = Counter()
 
     with sync_playwright() as pw:
-        launch_args = {}
-        if stealth:
-            launch_args["args"] = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ]
-        browser = pw.chromium.launch(headless=headless, **launch_args)
+        browser = launch_chromium(pw, headless, stealth)
         context_opts = {
             "viewport": {"width": 1280, "height": 900},
             "locale": "zh-CN",
@@ -1316,13 +1360,7 @@ def batch_query(
     results = {"success": [], "failed": [], "total_screenshots": 0}
 
     with sync_playwright() as pw:
-        launch_args = {}
-        if stealth:
-            launch_args["args"] = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ]
-        browser = pw.chromium.launch(headless=headless, **launch_args)
+        browser = launch_chromium(pw, headless, stealth)
 
         context_opts = {
             "viewport": {"width": 1280, "height": 900},
