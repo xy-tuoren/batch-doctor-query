@@ -22,6 +22,7 @@ import os
 import random
 import re
 import socket
+import sqlite3
 import sys
 import time
 from collections import Counter
@@ -52,10 +53,17 @@ NAME_FILE = "name.json"  # 默认姓名列表文件
 DEFAULT_CLASH_API = "unix:///tmp/verge/verge-mihomo.sock"
 DEFAULT_CLASH_GROUP = "批量查询轮换"
 DEFAULT_PROXY = "http://127.0.0.1:7897"
+DEFAULT_V2RAYN_PROXY = "socks5://127.0.0.1:10808"
+DEFAULT_V2RAYN_NODE_FILTER = "CF官方优选%"
 LEAF_PROXY_TYPES = frozenset({
     "Shadowsocks", "ShadowsocksR", "Snell", "Trojan", "Vmess", "Vless",
     "Hysteria", "Hysteria2", "TUIC", "WireGuard", "Socks5", "Http",
 })
+
+_SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from v2rayn_rotator import V2rayNRotator, warmup_v2rayn_proxy
 
 
 # ---------- 工具函数 ----------
@@ -272,6 +280,61 @@ def human_delay(base_ms: int = 300):
 def human_wait(page, base_ms: int = 300):
     """Playwright page.wait_for_timeout + 随机抖动（保持页面事件处理）"""
     page.wait_for_timeout(_jitter_ms(base_ms))
+
+
+# ---------- 执业证书编码 ----------
+
+
+_CERT_CODE_LABEL_RE = re.compile(
+    r"执业证书编码[：:\s]*([A-Za-z0-9][A-Za-z0-9+\-_]*)",
+    re.IGNORECASE,
+)
+
+
+def normalize_cert_code(cert: str) -> str:
+    return re.sub(r"\s+", "", cert).upper()
+
+
+def extract_cert_code(drawer_text: str) -> str | None:
+    """从详情文本提取执业证书编码（支持纯数字、XC10+…、X1014… 等）。"""
+    if not drawer_text:
+        return None
+    m = _CERT_CODE_LABEL_RE.search(drawer_text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def cert_code_in_text(cert: str, text: str) -> bool:
+    if not cert or not text:
+        return False
+    norm = normalize_cert_code(cert)
+    compact = re.sub(r"\s+", "", text).upper()
+    if norm in compact:
+        return True
+    if norm.replace("+", "") in compact.replace("+", ""):
+        return True
+    digits = re.sub(r"\D", "", norm)
+    if len(digits) >= 10 and digits in re.sub(r"\D", "", compact):
+        return True
+    return False
+
+
+def cert_codes_match(extracted: str | None, known: str | None) -> bool:
+    if not known:
+        return True
+    if not extracted or extracted.startswith("unknown_"):
+        return False
+    a, b = normalize_cert_code(extracted), normalize_cert_code(known)
+    if a == b:
+        return True
+    if a.replace("+", "") == b.replace("+", ""):
+        return True
+    digits_a = re.sub(r"\D", "", a)
+    digits_b = re.sub(r"\D", "", b)
+    if digits_a and digits_b and digits_a == digits_b:
+        return True
+    return False
 
 
 # ---------- 验证码识别器 ----------
@@ -1239,28 +1302,41 @@ def query_one(page, name: str, province: str, hospital: str, solver: CaptchaSolv
                 if panel is None:
                     raise PWTimeout("详情面板文本读取失败")
                 drawer_text = _read_locator_text(panel, timeout_ms=5000)
-            match = re.search(r"执业证书编码[：:]\s*(\d+)", drawer_text)
-            if match:
-                cert_code = match.group(1)
-            else:
+            cert_code = extract_cert_code(drawer_text)
+            if not cert_code:
                 cert_code = f"unknown_{i + 1}"
 
             # 如果已知证书编码，只截图匹配的那一个
-            if known_cert_code and cert_code != known_cert_code:
-                log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}（不匹配 {known_cert_code}）")
-                close_detail_panel(page)
-                continue
+            save_cert = cert_code
+            if known_cert_code:
+                if cert_codes_match(cert_code, known_cert_code):
+                    save_cert = known_cert_code
+                elif cert_code.startswith("unknown_"):
+                    if total == 1 or cert_code_in_text(known_cert_code, drawer_text):
+                        log(f"  ⚠ [{i + 1}/{total}] 证书编码未解析，"
+                            f"使用名单编码 {known_cert_code}")
+                        save_cert = known_cert_code
+                    else:
+                        log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}"
+                            f"（不匹配 {known_cert_code}）")
+                        close_detail_panel(page)
+                        continue
+                else:
+                    log(f"  ⏭ [{i + 1}/{total}] 跳过 {name}_{cert_code}"
+                        f"（不匹配 {known_cert_code}）")
+                    close_detail_panel(page)
+                    continue
 
             # 截图命名：姓名_证书编码.png（跳过已存在的）
-            filename = os.path.join(OUTPUT_DIR, f"{name}_{cert_code}.png")
+            filename = os.path.join(OUTPUT_DIR, f"{name}_{save_cert}.png")
             if os.path.exists(filename):
-                log(f"  ⏭ [{i + 1}/{total}] {name}_{cert_code}（已存在）")
+                log(f"  ⏭ [{i + 1}/{total}] {name}_{save_cert}（已存在）")
                 saved += 1  # 算作已处理
                 close_detail_panel(page)
                 continue
 
             panel.screenshot(path=filename)
-            log(f"  💾 [{i + 1}/{total}] {name}_{cert_code}")
+            log(f"  💾 [{i + 1}/{total}] {name}_{save_cert}")
             saved += 1
             close_detail_panel(page)
         except Exception as e:
@@ -1352,12 +1428,14 @@ def batch_query(
     proxy: str | None = None,
     stealth: bool = True,
     clash_rotator: ClashRotator | None = None,
+    v2rayn_rotator: V2rayNRotator | None = None,
 ):
     """批量查询多个医生，doctors 为 [{"name": str, "certCode": str|None}, ...]"""
     ensure_output_dir()
     solver = CaptchaSolver()
 
     results = {"success": [], "failed": [], "total_screenshots": 0}
+    ip_rotator = clash_rotator or v2rayn_rotator
 
     with sync_playwright() as pw:
         browser = launch_chromium(pw, headless, stealth)
@@ -1397,7 +1475,7 @@ def batch_query(
                     time.sleep(wait)
 
             ip_switch_attempts = 0
-            max_ip_switch = clash_rotator.node_count if clash_rotator else 0
+            max_ip_switch = ip_rotator.node_count if ip_rotator else 0
             done = False
 
             while not done:
@@ -1405,8 +1483,8 @@ def batch_query(
                     saved, search_at, ip_limited = query_one(
                         page, name, province, hospital, solver, cert_code, last_search_at)
 
-                    if ip_limited and clash_rotator and ip_switch_attempts < max_ip_switch:
-                        node = clash_rotator.rotate()
+                    if ip_limited and ip_rotator and ip_switch_attempts < max_ip_switch:
+                        node = ip_rotator.rotate()
                         if node:
                             ip_switch_attempts += 1
                             log(f"  🔁 换 IP 后重试: {name}（第 {ip_switch_attempts}/{max_ip_switch} 次）")
@@ -1507,10 +1585,22 @@ def main():
                         help=f"Clash 专用轮换代理组名（默认 {DEFAULT_CLASH_GROUP}）")
     parser.add_argument("--clash-secret", default=None,
                         help="Clash API 密钥（若配置了 secret）")
+    parser.add_argument("--v2rayn-rotate", action="store_true",
+                        help="查询受限时轮换 v2rayN 订阅节点（CF官方优选 等）")
+    parser.add_argument("--v2rayn-node-filter", default=DEFAULT_V2RAYN_NODE_FILTER,
+                        help="v2rayN 节点 Remarks 过滤（默认 CF官方优选%%）")
+    parser.add_argument("--v2rayn-port", type=int, default=10808,
+                        help="v2rayN 本地 mixed 端口（默认 10808）")
+    parser.add_argument("--v2rayn-warmup", action="store_true",
+                        help="仅启动 v2rayN/xray 代理并检测出口 IP，不查询")
     parser.add_argument("--no-stealth", action="store_true",
                         help="禁用反检测伪装（默认开启）")
 
     args = parser.parse_args()
+
+    if args.v2rayn_warmup:
+        warmup_v2rayn_proxy(args.v2rayn_node_filter, args.v2rayn_port)
+        sys.exit(0)
 
     set_output_dir(args.output)
 
@@ -1602,6 +1692,7 @@ def main():
     if args.proxy:
         print(f"代 理: {args.proxy}")
     clash_rotator = None
+    v2rayn_rotator = None
     if args.clash_api:
         try:
             clash_rotator = ClashRotator(
@@ -1621,6 +1712,23 @@ def main():
             sys.exit(1)
         if not args.proxy:
             print(f"⚠ 未指定 --proxy，建议同时设置 --proxy {DEFAULT_PROXY}")
+    if args.v2rayn_rotate:
+        try:
+            v2rayn_rotator = V2rayNRotator(
+                args.v2rayn_node_filter, args.v2rayn_port, log)
+            current = v2rayn_rotator.current_node()
+            print(f"v2rayN: {args.v2rayn_node_filter} / 端口 {args.v2rayn_port}"
+                  f"（{v2rayn_rotator.node_count} 个节点"
+                  f"{f'，当前 {current}' if current else ''}）")
+            if v2rayn_rotator.node_count == 0:
+                print("⚠ v2rayN 没有可轮换节点，查询受限时无法自动换 IP")
+        except (OSError, RuntimeError, sqlite3.Error) as e:
+            print(f"❌ v2rayN 节点加载失败: {e}")
+            print("   请确认 v2rayN 已安装且订阅已更新")
+            sys.exit(1)
+        if not args.proxy:
+            args.proxy = DEFAULT_V2RAYN_PROXY
+            print(f"代 理: {args.proxy}（v2rayN 默认）")
     print(f"总人数: {len(doctor_list)}, 已有截图: {already}, 待查询: {len(pending)}")
     if pending:
         preview = [d['name'] for d in pending[:5]]
@@ -1633,7 +1741,8 @@ def main():
 
     batch_query(
         pending, args.province, args.hospital, args.interval,
-        args.headless, args.proxy, not args.no_stealth, clash_rotator)
+        args.headless, args.proxy, not args.no_stealth,
+        clash_rotator, v2rayn_rotator)
 
 if __name__ == "__main__":
     main()
